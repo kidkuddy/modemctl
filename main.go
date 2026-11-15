@@ -150,11 +150,17 @@ func adToken(crVersion, waInnerVersion, rd string) string {
 	return md5Hex(md5Hex(crVersion+waInnerVersion) + rd)
 }
 
+// loggedIn asks whether OUR cookie has a session. multi_data=1 is required: without it the
+// modem answers "ok" whenever anybody is logged in, whatever cookie we send.
+func loggedIn() bool {
+	return str(get("loginfo", map[string]string{"multi_data": "1"}), "loginfo") == "ok"
+}
+
 // login reuses the cached session cookie and only logs in when the modem says it expired.
 func login() {
 	if b, err := os.ReadFile(cookiePath()); err == nil {
 		cookie = strings.TrimSpace(string(b))
-		if str(get("loginfo", nil), "loginfo") == "ok" {
+		if loggedIn() {
 			return
 		}
 		cookie = ""
@@ -175,6 +181,9 @@ func login() {
 		die("login failed: result=%s (attempts left before lockout: %s)", res, str(get("psw_fail_num_str", nil), "psw_fail_num_str"))
 	}
 	cookie, _, _ = strings.Cut(setCookie, ";")
+	if !loggedIn() {
+		die("login was accepted but the session is not valid")
+	}
 	if err := os.MkdirAll(filepath.Dir(cookiePath()), 0o700); err != nil {
 		die("%v", err)
 	}

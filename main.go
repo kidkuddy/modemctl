@@ -18,14 +18,18 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
+	"unicode"
 	"unicode/utf16"
 )
 
 const usage = `modemctl - CLI for the ZTE MC888x web API (goform)
 
   modemctl status                     signal / network / WAN summary
-  modemctl devices                    connected Wi-Fi and LAN clients
+  modemctl devices                    connected Wi-Fi and LAN clients, as a table
+  modemctl name MAC NAME              give a device a name on the modem
+  modemctl ussd CODE [REPLY...]       run a USSD code (e.g. '*111#'), then answer its menus
   modemctl sms                        list SMS
   modemctl sms send NUMBER TEXT       send SMS
   modemctl sms rm ID [ID...]          delete SMS
@@ -229,6 +233,16 @@ func smsDecode(h string) string {
 	return string(utf16.Decode(u))
 }
 
+// printable replaces control characters so an SMS cannot send escape sequences to the terminal.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || unicode.IsPrint(r) {
+			return r
+		}
+		return unicode.ReplacementChar
+	}, s)
+}
+
 func smsList() {
 	r := get("sms_data_total", map[string]string{
 		"page": "0", "data_per_page": "500", "mem_store": "1", "tags": "10", "order_by": "order by id desc",
@@ -241,7 +255,82 @@ func smsList() {
 		if hexNum {
 			num = smsDecode(num)
 		}
-		fmt.Printf("[%s] %s  %s  tag=%s\n  %s\n", str(m, "id"), str(m, "date"), num, str(m, "tag"), smsDecode(str(m, "content")))
+		fmt.Printf("[%s] %s  %s  tag=%s\n  %s\n", str(m, "id"), str(m, "date"), printable(num), str(m, "tag"), printable(smsDecode(str(m, "content"))))
+	}
+}
+
+// privateMAC reports a locally administered address: phones randomize these per network,
+// so such a MAC identifies "this phone on this Wi-Fi", not the hardware vendor.
+func privateMAC(mac string) bool {
+	b, err := hex.DecodeString(strings.ReplaceAll(mac, ":", ""))
+	return err == nil && len(b) == 6 && b[0]&2 != 0
+}
+
+func devices() {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tIP\tMAC\tLINK\tNOTE")
+	names := map[string]string{} // names saved with "modemctl name" win over what the device announces
+	saved, _ := get("hostNameList", nil)["devices"].([]any)
+	for _, x := range saved {
+		m, _ := x.(map[string]any)
+		names[strings.ToUpper(str(m, "mac"))] = str(m, "hostname")
+	}
+	row := func(list any, link func(map[string]any) string) {
+		items, _ := list.([]any)
+		for _, x := range items {
+			m, _ := x.(map[string]any)
+			if n := names[strings.ToUpper(str(m, "mac_addr"))]; n != "" {
+				m["hostname"] = n
+			}
+			note := ""
+			if privateMAC(str(m, "mac_addr")) {
+				note = "private (randomized) MAC"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", printable(str(m, "hostname")),
+				printable(str(m, "ip_addr")), str(m, "mac_addr"), link(m), note)
+		}
+	}
+	row(get("station_list", nil)["station_list"], func(m map[string]any) string {
+		if strings.Contains(str(m, "ssid_index"), "2") || strings.Contains(str(m, "interfacetype"), "5") {
+			return "wifi 5GHz"
+		}
+		return "wifi 2.4GHz"
+	})
+	row(get("lan_station_list", nil)["lan_station_list"], func(map[string]any) string { return "ethernet" })
+	w.Flush()
+}
+
+// ussd runs one USSD session: send code, print the reply, answer menus with replies, then hang up.
+func ussd(code string, replies []string) {
+	step := func(params map[string]string) (action string) {
+		if r := set("USSD_PROCESS", params); str(r, "result") != "success" {
+			die("ussd rejected: %v", r)
+		}
+		for i := 0; ; i++ { // ussd_write_flag: 15 = waiting for the network, 16 = reply ready
+			flag := str(get("ussd_write_flag", nil), "ussd_write_flag")
+			if flag == "16" {
+				break
+			}
+			if flag != "15" || i > 30 {
+				die("ussd failed: ussd_write_flag=%q (1 no service, 2 network terminated, 3/4 timeout, 99 unsupported)", flag)
+			}
+			time.Sleep(time.Second)
+		}
+		r := get("ussd_data_info", nil)
+		text := str(r, "ussd_data")
+		if str(r, "ussd_dcs") != "15" { // dcs 15 is plain text, anything else is UTF-16BE hex
+			text = smsDecode(text)
+		}
+		fmt.Println(printable(text))
+		return str(r, "ussd_action")
+	}
+	action := step(map[string]string{"USSD_operator": "ussd_send", "USSD_send_number": code})
+	for _, reply := range replies {
+		fmt.Println("> " + reply)
+		action = step(map[string]string{"USSD_operator": "ussd_reply", "USSD_reply_number": reply})
+	}
+	if action != "0" { // network still waits for an answer: close the session
+		set("USSD_PROCESS", map[string]string{"USSD_operator": "ussd_cancel"})
 	}
 }
 
@@ -283,10 +372,11 @@ func main() {
 	case cmd == "status":
 		show(get(statusNVs, nil))
 	case cmd == "devices":
-		show(map[string]any{
-			"wifi": get("station_list", nil)["station_list"],
-			"lan":  get("lan_station_list", nil)["lan_station_list"],
-		})
+		devices()
+	case cmd == "name" && len(rest) == 2:
+		show(set("EDIT_HOSTNAME", map[string]string{"mac": rest[0], "hostname": rest[1]}))
+	case cmd == "ussd" && len(rest) > 0:
+		ussd(rest[0], rest[1:])
 	case cmd == "get" && len(rest) > 0:
 		show(get(rest[0], kv(rest[1:])))
 	case cmd == "set" && len(rest) > 0:

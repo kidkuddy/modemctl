@@ -12,6 +12,13 @@ func TestCodecs(t *testing.T) {
 			t.Errorf("roundtrip %q = %q", s, got)
 		}
 	}
+	// ESC (C0) and CSI (C1) must not reach the terminal; newlines and accents stay
+	if got := printable("a\x1b[2Jb\u009bc\né"); got != "a\ufffd[2Jb\ufffdc\né" {
+		t.Errorf("printable = %q", got)
+	}
+	if !privateMAC("D6:3E:EC:B1:FE:A7") || privateMAC("C8:89:F3:C4:49:97") || privateMAC("junk") {
+		t.Error("privateMAC misclassified")
+	}
 	// SHA256("") known vector, uppercase like the web UI's SHA256()
 	if got := sha256Hex(""); got != "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855" {
 		t.Errorf("sha256Hex = %s", got)
